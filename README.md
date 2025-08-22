@@ -4,6 +4,8 @@ Unofficial implementation of "MLorc: Momentum Low-rank Compression for Large Lan
 
 This repository introduces **MLorc (Momentum Low-rank Compression)**, a novel and highly memory-efficient paradigm designed to significantly reduce the memory footprint of full-parameter fine-tuning for large language models. Based on the paper "[MLorc: Momentum Low-rank Compression for Large Language Model Adaptation](https://arxiv.org/abs/2506.01897)" this method offers a compelling alternative to existing memory-efficient techniques.
 
+<img width="1385" height="469" alt="image" src="https://github.com/user-attachments/assets/7bcab5ec-beaf-4d1a-b115-81ab1a7d4b18" />
+
 ---
 
 ### How MLorc Works
@@ -22,6 +24,8 @@ MLorc is broadly applicable to any momentum-based optimizer (e.g., Adam, Lion) a
 * **State-of-the-Art Performance:** Empirically, MLorc consistently **outperforms other memory-efficient methods like LoRA and GaLore** in terms of validation accuracy. It can even match or **exceed the performance of full fine-tuning** with a small rank (e.g., `rank=4`).
 * **Memory and Time Efficiency:** It maintains **comparable memory efficiency to LoRA** while demonstrating **improved time efficiency compared to GaLore**.
 * **Theoretical Guarantees:** MLorc offers a **theoretical guarantee for convergence**, matching the convergence rate of the original Lion optimizer under reasonable assumptions.
+
+<img width="1403" height="602" alt="image" src="https://github.com/user-attachments/assets/ad76a8ab-966d-4121-b010-28a2ddb6e28d" />
 
 ---
 

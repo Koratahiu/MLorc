@@ -10,7 +10,7 @@ from util.OrthoGrad import _orthogonalize_gradient
 from util.Effective_Shape import _get_effective_shape
 from util.BF16_Stochastic_Rounding import add_stochastic_
 
-class MLorc_DAdapt_Lion(torch.optim.optimizer):
+class MLorc_DAdapt_Lion(torch.optim.Optimizer):
     """
     Implements the MLorc-Lion algorithm with D-Adaptation.
 
@@ -111,7 +111,7 @@ class MLorc_DAdapt_Lion(torch.optim.optimizer):
         """Performs a single optimization step on a single parameter."""
         if p.grad is None:
             return
-
+        grad = p.grad
         if grad.dtype != torch.float32:
             grad = grad.float()
         if group["clip_threshold"] > 0.0:
@@ -166,7 +166,8 @@ class MLorc_DAdapt_Lion(torch.optim.optimizer):
 
             # Reconstruct momentum m_{t-1}
             exp_avg_prev = state['mu'] @ torch.diag(state['ms']) @ state['mv']
-
+            if exp_avg_prev.dtype != torch.float32:
+                exp_avg_prev = exp_avg_prev.float()
             # Compute update term c_t = β1*m_{t-1} + (1-β1)*g_t
             update_term_ct = torch.lerp(grad_reshaped, exp_avg_prev, beta1)
 
@@ -196,8 +197,10 @@ class MLorc_DAdapt_Lion(torch.optim.optimizer):
             exp_avg = state["exp_avg"]
 
             # Compute update term and sign for the update
+            if exp_avg.dtype != torch.float32:
+                exp_avg = exp_avg.float()
             exp_avg = exp_avg.mul_(beta1).add_(grad, alpha=(1-beta1))
-            
+
             signed_update = exp_avg.clone().sign()
 
             if self.use_cautious:
@@ -219,6 +222,8 @@ class MLorc_DAdapt_Lion(torch.optim.optimizer):
 
         # --- D-Adaptation Metric Accumulation ---
         # This part populates the global state for the final d-update in step()
+        if s.dtype != torch.float32:
+            s = s.float()
         if slice_p > 1: # slicing path, for memory efficiency
             sliced_signed_update = signed_update.flatten()[::slice_p]
             numerator_contrib = dlr * torch.dot(sliced_signed_update, s)

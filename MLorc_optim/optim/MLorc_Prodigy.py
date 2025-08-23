@@ -84,7 +84,7 @@ class MLorc_Prodigy(torch.optim.Optimizer):
         }
         self.stochastic_rounding = stochastic_rounding
         super().__init__(params, defaults)
-        self.init_step
+        self.init_step()
 
     @property
     def supports_fused_back_pass(self):

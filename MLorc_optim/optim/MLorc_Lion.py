@@ -7,7 +7,7 @@ from util.OrthoGrad import _orthogonalize_gradient
 from util.Effective_Shape import _get_effective_shape
 from util.BF16_Stochastic_Rounding import add_stochastic_
 
-class MLorc_Lion(torch.optim.optimizer):
+class MLorc_Lion(torch.optim.Optimizer):
     """
     Implements the MLorc-Lion algorithm.
 
@@ -92,6 +92,7 @@ class MLorc_Lion(torch.optim.optimizer):
         if p.grad is None:
             return
 
+        grad = p.grad
         if grad.dtype != torch.float32:
             grad = grad.float()
         if group["clip_threshold"] > 0.0:
@@ -139,7 +140,8 @@ class MLorc_Lion(torch.optim.optimizer):
 
             # Reconstruct momentum m_{t-1}
             exp_avg_prev = state['mu'] @ torch.diag(state['ms']) @ state['mv']
-
+            if exp_avg_prev.dtype != torch.float32:
+                exp_avg_prev = exp_avg_prev.float()
             # Compute update term c_t = β1*m_{t-1} + (1-β1)*g_t
             update_term_ct = torch.lerp(grad_reshaped, exp_avg_prev, beta1)
 
@@ -167,6 +169,8 @@ class MLorc_Lion(torch.optim.optimizer):
             exp_avg = state["exp_avg"]
 
             # Compute update term and sign for the update
+            if exp_avg.dtype != torch.float32:
+                exp_avg = exp_avg.float()
             exp_avg = exp_avg.mul_(beta1).add_(grad, alpha=(1-beta1))
             
             update = exp_avg.clone().sign()
@@ -188,7 +192,6 @@ class MLorc_Lion(torch.optim.optimizer):
             p.data.add_(-update_for_param)
 
             del update_for_param
-
 
     @torch.no_grad()
     def step(self, closure: Optional[callable] = None):

@@ -9,6 +9,7 @@ def _rsvd(A: Tensor, rank: int, oversampling: int) -> Tuple[Tensor, Tensor, Tens
         m, n = A.shape
         l = rank + oversampling
         true_rank = min(m, n, rank)
+        A = A.float()
 
         if true_rank == 0:
             U = torch.zeros(m, rank, dtype=torch.float32, device=device)
@@ -21,7 +22,7 @@ def _rsvd(A: Tensor, rank: int, oversampling: int) -> Tuple[Tensor, Tensor, Tens
             U, S, Vh = U_full[:, :true_rank], S_full[:true_rank], Vh_full[:true_rank, :]
         else:
             Omega = torch.randn(n, l, dtype=torch.float32, device=device)
-            Y = A @ Omega
+            Y = A.float() @ Omega
             Q, _ = torch.linalg.qr(Y.float())
             B = Q.T @ A
             U_tilde, S, Vh = torch.linalg.svd(B.float(), full_matrices=False)

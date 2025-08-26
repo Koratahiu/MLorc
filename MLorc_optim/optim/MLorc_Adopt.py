@@ -27,9 +27,9 @@ class MLorc_Adopt(torch.optim.Optimizer):
             parameter groups
         lr (float): learning rate (default: 1e-3)
         betas (tuple[float, float]): coefficients used for computing running
-            averages of momentum and variance (default: (0.9, 0.999))
+            averages of momentum and variance (default: (0.9, 0.9999))
         eps (float): term added to the denominator to improve
-            numerical stability (default: 1e-8)
+            numerical stability (default: 1e-6)
         weight_decay (float): weight decay (L2 penalty) (default: 0)
         use_bias_correction (boolean): Turn on Adam's bias correction. (default: False)
         rank (int): the rank for the low-rank approximation (default: 4).
@@ -43,22 +43,25 @@ class MLorc_Adopt(torch.optim.Optimizer):
         use_grams (bool): whether to combine the gradient's direction with the
             update's magnitude (default: False).
         use_orthograd (bool): whether to use OrthoGrad. (default: False)
+        disable_mlorc (bool): Whether to disable MLorc compression and use the uncompressed
+            optimizer. (Default: False)
     """
 
     def __init__(
         self,
         params,
         lr: float = 1e-3,
-        betas: tuple[float, float] = (0.9, 0.999),
-        eps: float = 1e-8,
+        betas: tuple[float, float] = (0.9, 0.9999),
+        eps: float = 1e-6,
         weight_decay: float = 0.0,
         rank: int = 4,
         oversampling: int = 0,
         vector_reshape: bool = True,
         stochastic_rounding: bool = True,
-        use_atan2: bool = True,
-        use_grams: bool = True,
-        use_orthograd: bool = True,
+        use_atan2: bool = False,
+        use_grams: bool = False,
+        use_orthograd: bool = False,
+        disable_mlorc: bool = False,
     ):
         if not (lr >= 0.0):
             raise ValueError(f"Learning-rate should be >= 0.0. Got {lr}")
@@ -79,6 +82,7 @@ class MLorc_Adopt(torch.optim.Optimizer):
         self.use_atan2 = use_atan2
         self.use_grams = use_grams
         self.use_orthograd = use_orthograd
+        self.disable_mlorc = disable_mlorc
         super().__init__(params, defaults)
 
     @property
@@ -103,79 +107,106 @@ class MLorc_Adopt(torch.optim.Optimizer):
         # State Initialization
         if len(state) == 0:
             state['step'] = 0
-            state['factored'] = not (len(p.shape) == 1 and not group['vector_reshape'])
+            if not self.disable_mlorc:
+                state['factored'] = not (len(p.shape) == 1 and not group['vector_reshape'])
             dev, dtype =  p.device, torch.float32
-            if state['factored']:
-                state['effective_shape'] = _get_effective_shape(p.numel())
-                d1, d2 = state['effective_shape']
-                r = group['rank']
-                
-                # m_0 = 0
-                state['mu_m'], state['ms_m'], state['mv_m'] = (
-                    torch.zeros(d1, r, device=dev, dtype=dtype),
-                    torch.zeros(r, device=dev, dtype=dtype),
-                    torch.zeros(r, d2, device=dev, dtype=dtype),
-                )
-                # v_0 = g_0^2
-                vt_init = grad.view(d1, d2).square_()
-                state['mu_v'], state['ms_v'], state['mv_v'] = _rsvd(
-                    vt_init, r, group['oversampling']
-                )
-            else: # Fallback for non-factored tensors
+
+            if not self.disable_mlorc:
+                if state['factored']:
+                    state['effective_shape'] = _get_effective_shape(p.numel())
+                    d1, d2 = state['effective_shape']
+                    r = group['rank']
+                    
+                    # m_0 = 0
+                    state['mu_m'], state['ms_m'], state['mv_m'] = (
+                        torch.zeros(d1, r, device=dev, dtype=dtype),
+                        torch.zeros(r, device=dev, dtype=dtype),
+                        torch.zeros(r, d2, device=dev, dtype=dtype),
+                    )
+                    # v_0 = g_0^2
+                    vt_init = grad.view(d1, d2).square_()
+                    state['mu_v'], state['ms_v'], state['mv_v'] = _rsvd(
+                        vt_init, r, group['oversampling']
+                    )
+                else: # Fallback for non-factored tensors
+                    state['exp_avg'] = torch.zeros_like(p, device=dev, dtype=dtype) # m_0
+                    state['exp_avg_sq'] = grad.square() # v_0
+            else:
                 state['exp_avg'] = torch.zeros_like(p, device=dev, dtype=dtype) # m_0
-                state['exp_avg_sq'] = grad.square(device=dev, dtype=dtype)   # v_0
-        
+                state['exp_avg_sq'] = grad.square() # v_0
+
         # The first step is for initialization only (skip when use_atan2 as it's scale invariant).
         if state['step'] == 0 and not self.use_atan2:
             state['step'] += 1
             return
 
         beta1, beta2 = group['betas']
-        
-        if state['factored']:
-            d1, d2 = state['effective_shape']
-            rank, oversampling = group['rank'], group['oversampling']
-            
-            # Reconstruct m_{t-1} and v_{t-1}
-            mt_prev = state['mu_m'] @ torch.diag(state['ms_m']) @ state['mv_m']
-            vt_prev_raw = state['mu_v'] @ torch.diag(state['ms_v']) @ state['mv_v']
 
-            # non-negativity correction 
-            neg_mask = vt_prev_raw < 0
-            vt_prev = vt_prev_raw.relu()
-            if neg_mask.any():
-                adaptive_constant = torch.abs(vt_prev_raw[neg_mask].mean())
-                vt_prev[neg_mask] += adaptive_constant
+        if not self.disable_mlorc:
+            if state['factored']:
+                d1, d2 = state['effective_shape']
+                rank, oversampling = group['rank'], group['oversampling']
 
-            # ADOPT Step A: Decorrelate g_t using v_{t-1}
-            grad_reshaped = grad.view(d1, d2)
-            denom = vt_prev.sqrt()
+                # Reconstruct m_{t-1} and v_{t-1}
+                mt_prev = state['mu_m'] @ torch.diag(state['ms_m']) @ state['mv_m']
+                vt_prev_raw = state['mu_v'] @ torch.diag(state['ms_v']) @ state['mv_v']
 
-            if self.use_atan2:
-                normalized_grad = torch.atan2(grad_reshaped, denom)
-            else:
-                normalized_grad = grad_reshaped / denom.add_(group['eps'])
+                # non-negativity correction 
+                neg_mask = vt_prev_raw < 0
+                vt_prev = vt_prev_raw.relu()
+                if neg_mask.any():
+                    adaptive_constant = torch.abs(vt_prev_raw[neg_mask].mean())
+                    vt_prev[neg_mask] += adaptive_constant
 
-            # ADOPT Step B: Update momentum m_t using normalized gradient
-            mt = mt_prev.mul_(beta1).add_(normalized_grad, alpha=1.0 - beta1)
+                # ADOPT Step A: Decorrelate g_t using v_{t-1}
+                grad_reshaped = grad.view(d1, d2)
+                denom = vt_prev.sqrt()
 
-            update = mt.view(p.shape)
-            if self.use_grams:
-                update = grad.sign() * update.abs()
+                if self.use_atan2:
+                    normalized_grad = torch.atan2(grad_reshaped, denom)
+                else:
+                    normalized_grad = grad_reshaped / denom.add_(group['eps'])
 
-            # Update second moment v_t for the *next* step using raw g_t
-            vt = vt_prev.mul_(beta2).addcmul_(grad_reshaped, grad_reshaped, value=1.0 - beta2)
+                # ADOPT Step B: Update momentum m_t using normalized gradient
+                mt = mt_prev.mul_(beta1).add_(normalized_grad, alpha=1.0 - beta1)
 
-            # Compress and store new factors for m_t and v_t
-            state['mu_m'], state['ms_m'], state['mv_m'] = _rsvd(mt, rank, oversampling)
-            state['mu_v'], state['ms_v'], state['mv_v'] = _rsvd(vt, rank, oversampling)
+                update = mt.view(p.shape)
+                if self.use_grams:
+                    update = grad.sign() * update.abs()
 
-        else: # Standard ADOPT logic for non-factored tensors
+                # Update second moment v_t for the *next* step using raw g_t
+                vt = vt_prev.mul_(beta2).addcmul_(grad_reshaped, grad_reshaped, value=1.0 - beta2)
+
+                # Compress and store new factors for m_t and v_t
+                state['mu_m'], state['ms_m'], state['mv_m'] = _rsvd(mt, rank, oversampling)
+                state['mu_v'], state['ms_v'], state['mv_v'] = _rsvd(vt, rank, oversampling)
+
+            else: # Standard ADOPT logic for non-factored tensors
+                m, v = state['exp_avg'], state['exp_avg_sq'] # m_{t-1}, v_{t-1}
+
+                # ADOPT Step A: Decorrelate g_t using v_{t-1}
+                denom = v.sqrt()
+
+                if self.use_atan2:
+                    normalized_grad = torch.atan2(grad, denom)
+                else:
+                    normalized_grad = grad / denom.add_(group['eps'])
+
+                # ADOPT Step B: Update momentum m_t
+                m.mul_(beta1).add_(normalized_grad, alpha=1.0 - beta1)
+
+                update = m # This is m_t
+                if self.use_grams:
+                    update = grad.sign() * update.abs()
+
+                # Update second moment v_t for the next step using raw g_t
+                v.mul_(beta2).addcmul_(grad, grad.conj(), value=1 - beta2)
+        else:
             m, v = state['exp_avg'], state['exp_avg_sq'] # m_{t-1}, v_{t-1}
 
             # ADOPT Step A: Decorrelate g_t using v_{t-1}
             denom = v.sqrt()
-            
+
             if self.use_atan2:
                 normalized_grad = torch.atan2(grad, denom)
             else:
@@ -183,9 +214,6 @@ class MLorc_Adopt(torch.optim.Optimizer):
 
             # ADOPT Step B: Update momentum m_t
             m.mul_(beta1).add_(normalized_grad, alpha=1.0 - beta1)
-
-            # Parameter Update
-
 
             update = m # This is m_t
             if self.use_grams:

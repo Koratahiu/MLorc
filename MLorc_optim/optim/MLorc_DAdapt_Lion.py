@@ -37,6 +37,8 @@ class MLorc_DAdapt_Lion(torch.optim.Optimizer):
             matrices to apply low-rank compression (default: True).
         stochastic_rounding (bool, optional): whether to use stochastic
             rounding for BF16 parameter updates (default: False).
+        use_orthograd (bool): whether to use OrthoGrad.  (default: False)
+        use_cautious (bool): whether to use cautious variant.  (default: False)
         clip_threshold (float, optional): whether to clip the gradients norm
             per-parameter as proposed in the paper `Lions and Muons: Optimization via
             Stochastic Frank-Wolfe` (https://arxiv.org/abs/2506.04192) to make Lion more stable
@@ -49,6 +51,8 @@ class MLorc_DAdapt_Lion(torch.optim.Optimizer):
             0 means no logging (default: 0).
         fsdp_in_use (bool, optional): Set to True if using FSDP, for correct
             distributed aggregation (default: False).
+        disable_mlorc (bool): Whether to disable MLorc compression and use the uncompressed
+            optimizer. (Default: False)
     """
 
     def __init__(
@@ -62,8 +66,9 @@ class MLorc_DAdapt_Lion(torch.optim.Optimizer):
         vector_reshape: bool = True,
         stochastic_rounding: bool = False,
         use_orthograd: bool = False,
-        use_cautious: bool = True,
+        use_cautious: bool = False,
         clip_threshold: float = 5.0,
+        disable_mlorc: bool = False,
         # D-Adaptation parameters
         d0: float = 1e-6,
         slice_p: int = 11,
@@ -89,6 +94,7 @@ class MLorc_DAdapt_Lion(torch.optim.Optimizer):
         }
         self.stochastic_rounding = stochastic_rounding
         self.use_cautious = use_cautious
+        self.disable_mlorc = disable_mlorc
         super().__init__(params, defaults)
 
         # Global state for accumulating metrics across parameter updates within a single step.
@@ -126,20 +132,24 @@ class MLorc_DAdapt_Lion(torch.optim.Optimizer):
         # State Initialization
         if len(state) == 0:
             state['step'] = 0
-            state['factored'] = not (len(p.shape) == 1 and not group['vector_reshape'])
+            if not self.disable_mlorc:
+                state['factored'] = not (len(p.shape) == 1 and not group['vector_reshape'])
             slice_p = group['slice_p']
             dtype = torch.float32
             # D-Adaptation state
             state['s'] = torch.zeros_like(p.flatten()[::slice_p], device=p.device) if slice_p > 1 else torch.zeros_like(p)
 
-            if state['factored']:
-                state['effective_shape'] = _get_effective_shape(p.numel())
-                d1, d2 = state['effective_shape']
-                r = group['rank']
-                state['mu'] = torch.zeros(d1, r, device=p.device, dtype=dtype)
-                state['ms'] = torch.zeros(r, device=p.device, dtype=dtype)
-                state['mv'] = torch.zeros(r, d2, device=p.device, dtype=dtype)
-            else: # Fallback to standard Lion
+            if not self.disable_mlorc:
+                if state['factored']:
+                    state['effective_shape'] = _get_effective_shape(p.numel())
+                    d1, d2 = state['effective_shape']
+                    r = group['rank']
+                    state['mu'] = torch.zeros(d1, r, device=p.device, dtype=dtype)
+                    state['ms'] = torch.zeros(r, device=p.device, dtype=dtype)
+                    state['mv'] = torch.zeros(r, d2, device=p.device, dtype=dtype)
+                else: # Fallback to standard Lion
+                    state['exp_avg'] = torch.zeros_like(p, device=p.device, dtype=dtype)
+            else:
                 state['exp_avg'] = torch.zeros_like(p, device=p.device, dtype=dtype)
 
         state['step'] += 1
@@ -159,44 +169,63 @@ class MLorc_DAdapt_Lion(torch.optim.Optimizer):
         s = state['s']
         signed_update = None
 
-        if state['factored']:
-            # --- MLorc-Lion Path ---
-            d1, d2 = state['effective_shape']
-            grad_reshaped = grad.view(d1, d2)
+        if not self.disable_mlorc:
+            if state['factored']:
+                # --- MLorc-Lion Path ---
+                d1, d2 = state['effective_shape']
+                grad_reshaped = grad.view(d1, d2)
 
-            # Reconstruct momentum m_{t-1}
-            exp_avg_prev = state['mu'] @ torch.diag(state['ms']) @ state['mv']
-            if exp_avg_prev.dtype != torch.float32:
-                exp_avg_prev = exp_avg_prev.float()
-            # Compute update term c_t = β1*m_{t-1} + (1-β1)*g_t
-            update_term_ct = torch.lerp(grad_reshaped, exp_avg_prev, beta1)
+                # Reconstruct momentum m_{t-1}
+                exp_avg_prev = state['mu'] @ torch.diag(state['ms']) @ state['mv']
+                if exp_avg_prev.dtype != torch.float32:
+                    exp_avg_prev = exp_avg_prev.float()
+                # Compute update term c_t = β1*m_{t-1} + (1-β1)*g_t
+                update_term_ct = torch.lerp(grad_reshaped, exp_avg_prev, beta1)
 
-            signed_update = update_term_ct.sign()
+                signed_update = update_term_ct.sign()
 
-            if self.use_cautious:
-                mask = (signed_update * grad_reshaped > 0).to(grad_reshaped.dtype)
-                mask.div_(mask.mean().clamp_(min=1e-3))
-                signed_update.mul_(mask)
-                del mask
-            signed_update.view(p.shape)
+                if self.use_cautious:
+                    mask = (signed_update * grad_reshaped > 0).to(grad_reshaped.dtype)
+                    mask.div_(mask.mean().clamp_(min=1e-3))
+                    signed_update.mul_(mask)
+                    del mask
+                signed_update.view(p.shape)
 
-            # Parameter update: p_t = p_{t-1} - lr * sign(c_t)
-            update_for_param = signed_update.mul(dlr)
+                # Parameter update: p_t = p_{t-1} - lr * sign(c_t)
+                update_for_param = signed_update.mul(dlr)
 
-            # Update momentum m_t = β2*m_{t-1} + (1-β2)*lr*g_t
-            exp_avg_new = exp_avg_prev.mul(beta2).add_(grad_reshaped, alpha=dlr * (1-beta2))
-            del exp_avg_prev, grad_reshaped
+                # Update momentum m_t = β2*m_{t-1} + (1-β2)*lr*g_t
+                exp_avg_new = exp_avg_prev.mul(beta2).add_(grad_reshaped, alpha=dlr * (1-beta2))
+                del exp_avg_prev, grad_reshaped
 
-            # Compress new momentum m_t and store factors
-            mu_new, ms_new, mv_new = _rsvd(exp_avg_new, group['rank'], group['oversampling'])
-            state['mu'].copy_(mu_new)
-            state['ms'].copy_(ms_new)
-            state['mv'].copy_(mv_new)
+                # Compress new momentum m_t and store factors
+                mu_new, ms_new, mv_new = _rsvd(exp_avg_new, group['rank'], group['oversampling'])
+                state['mu'].copy_(mu_new)
+                state['ms'].copy_(ms_new)
+                state['mv'].copy_(mv_new)
+            else:
+                # --- Fallback to standard D-Adapt Lion logic ---
+                exp_avg = state["exp_avg"]
+
+                # Compute update term and sign for the update
+                if exp_avg.dtype != torch.float32:
+                    exp_avg = exp_avg.float()
+                exp_avg = exp_avg.mul_(beta1).add_(grad, alpha=(1-beta1))
+
+                signed_update = exp_avg.clone().sign()
+
+                if self.use_cautious:
+                    mask = (signed_update * grad > 0).to(grad.dtype)
+                    mask.div_(mask.mean().clamp_(min=1e-3))
+                    signed_update.mul_(mask)
+                    del mask
+                update_for_param = signed_update.mul(dlr)
+
+                # Update momentum 
+                exp_avg.mul_(beta2).add_(grad, alpha=dlr * (1-beta2))
         else:
-            # --- Fallback to standard D-Adapt Lion logic ---
             exp_avg = state["exp_avg"]
 
-            # Compute update term and sign for the update
             if exp_avg.dtype != torch.float32:
                 exp_avg = exp_avg.float()
             exp_avg = exp_avg.mul_(beta1).add_(grad, alpha=(1-beta1))
@@ -210,7 +239,6 @@ class MLorc_DAdapt_Lion(torch.optim.Optimizer):
                 del mask
             update_for_param = signed_update.mul(dlr)
 
-            # Update momentum 
             exp_avg.mul_(beta2).add_(grad, alpha=dlr * (1-beta2))
 
         if p.dtype == torch.bfloat16 and self.stochastic_rounding:

@@ -7,7 +7,10 @@ This repository introduces **MLorc (Momentum Low-rank Compression)**, a novel an
 <img width="1385" height="469" alt="image" src="https://github.com/user-attachments/assets/7bcab5ec-beaf-4d1a-b115-81ab1a7d4b18" />
 
 ---
+### Install
+`pip install MLorc-optim`
 
+---
 ### How MLorc Works
 
 MLorc's core innovation lies in its approach to **momentum compression and reconstruction**:

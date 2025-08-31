@@ -2,10 +2,10 @@ import torch
 
 from typing import Tuple, Optional
 
-from util.Randomized_SVD import _rsvd
-from util.OrthoGrad import _orthogonalize_gradient
-from util.Effective_Shape import _get_effective_shape
-from util.BF16_Stochastic_Rounding import add_stochastic_
+from ..utilRandomized_SVD import _rsvd
+from ..utilOrthoGrad import _orthogonalize_gradient
+from ..utilEffective_Shape import _get_effective_shape
+from ..utilBF16_Stochastic_Rounding import add_stochastic_
 
 class MLorc_Lion(torch.optim.Optimizer):
     """

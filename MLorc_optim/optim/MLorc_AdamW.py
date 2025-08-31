@@ -48,6 +48,7 @@ class MLorc_AdamW(torch.optim.Optimizer):
         use_atan2: bool = False,
         use_grams: bool = False,
         use_orthograd: bool = False,
+        disable_mlorc: bool = False,
     ):
         if not (lr >= 0.0):
             raise ValueError(f"Learning-rate should be >= 0.0. Got {lr}")
@@ -66,6 +67,7 @@ class MLorc_AdamW(torch.optim.Optimizer):
             "use_grams": use_grams, "use_orthograd": use_orthograd, "use_bias_correction": use_bias_correction,
         }
         self.stochastic_rounding = stochastic_rounding
+        self.disable_mlorc = disable_mlorc
         super().__init__(params, defaults)
 
     @property
@@ -95,87 +97,118 @@ class MLorc_AdamW(torch.optim.Optimizer):
         # State Initialization
         if len(state) == 0:
             state['step'] = 0
-            state['factored'] = not (len(p.shape) == 1 and not group['vector_reshape'])
+            if not self.disable_mlorc:
+                state['factored'] = not (len(p.shape) == 1 and not group['vector_reshape'])
             dtype = torch.float32
             device = p.device
 
-            if state['factored']:
-                state['effective_shape'] = _get_effective_shape(p.numel())
-                d1, d2 = state['effective_shape']
-                r = group['rank']
+            if not self.disable_mlorc:
+                if state['factored']:
+                    state['effective_shape'] = _get_effective_shape(p.numel())
+                    d1, d2 = state['effective_shape']
+                    r = group['rank']
 
-                # SVD factors: U (d, r), S (r,), Vh (r, d)
-                # First moment (m)
-                state['mu_m'] = torch.zeros(d1, r, device=device, dtype=dtype)
-                state['ms_m'] = torch.zeros(r, device=device, dtype=dtype)
-                state['mv_m'] = torch.zeros(r, d2, device=device, dtype=dtype)
-                # Second moment (v)
-                state['mu_v'] = torch.zeros(d1, r, device=device, dtype=dtype)
-                state['ms_v'] = torch.zeros(r, device=device, dtype=dtype)
-                state['mv_v'] = torch.zeros(r, d2, device=device, dtype=dtype)
-            else:  # Fallback to standard AdamW for non-factored tensors
+                    # SVD factors: U (d, r), S (r,), Vh (r, d)
+                    # First moment (m)
+                    state['mu_m'] = torch.zeros(d1, r, device=device, dtype=dtype)
+                    state['ms_m'] = torch.zeros(r, device=device, dtype=dtype)
+                    state['mv_m'] = torch.zeros(r, d2, device=device, dtype=dtype)
+                    # Second moment (v)
+                    state['mu_v'] = torch.zeros(d1, r, device=device, dtype=dtype)
+                    state['ms_v'] = torch.zeros(r, device=device, dtype=dtype)
+                    state['mv_v'] = torch.zeros(r, d2, device=device, dtype=dtype)
+                else:  # Fallback to standard AdamW for non-factored tensors
+                    state['exp_avg'] = torch.zeros_like(p, device=device, dtype=dtype)
+                    state['exp_avg_sq'] = torch.zeros_like(p, device=device, dtype=dtype)
+            else:
                 state['exp_avg'] = torch.zeros_like(p, device=device, dtype=dtype)
                 state['exp_avg_sq'] = torch.zeros_like(p, device=device, dtype=dtype)
 
         state['step'] += 1
         beta1, beta2 = group['betas']
 
-        if state['factored']:
-            d1, d2 = state['effective_shape']
-            rank = group['rank']
-            oversampling = group['oversampling']
+        if not self.disable_mlorc:
+            if state['factored']:
+                d1, d2 = state['effective_shape']
+                rank = group['rank']
+                oversampling = group['oversampling']
 
-            # Reconstruct momentum from previous step's factors
-            mt_prev = state['mu_m'] @ torch.diag(state['ms_m']) @ state['mv_m']
-            vt_prev = state['mu_v'] @ torch.diag(state['ms_v']) @ state['mv_v']
+                # Reconstruct momentum from previous step's factors
+                mt_prev = state['mu_m'] @ torch.diag(state['ms_m']) @ state['mv_m']
+                vt_prev = state['mu_v'] @ torch.diag(state['ms_v']) @ state['mv_v']
 
-            # Correct reconstructed second moment (vt_prev) for non-negativity
-            neg_mask = vt_prev < 0
-            if neg_mask.any():
-                adaptive_constant = torch.abs(vt_prev[neg_mask].mean())
-            else:
-                adaptive_constant = torch.tensor(0.0, device=p.device, dtype=p.dtype)
+                # Correct reconstructed second moment (vt_prev) for non-negativity
+                neg_mask = vt_prev < 0
+                if neg_mask.any():
+                    adaptive_constant = torch.abs(vt_prev[neg_mask].mean())
+                else:
+                    adaptive_constant = torch.tensor(0.0, device=p.device, dtype=p.dtype)
 
-            vt_prev_corrected = vt_prev.relu()
-            vt_prev_corrected[neg_mask] += adaptive_constant
+                vt_prev_corrected = vt_prev.relu()
+                vt_prev_corrected[neg_mask] += adaptive_constant
 
-            # Update momentum in full-size
-            grad_reshaped = grad.view(d1, d2)
-            mt = mt_prev.mul_(beta1).add_(grad_reshaped, alpha=1.0 - beta1)
-            vt = vt_prev_corrected.mul_(beta2).addcmul_(grad_reshaped, grad_reshaped, value=1.0 - beta2)
+                # Update momentum in full-size
+                grad_reshaped = grad.view(d1, d2)
+                mt = mt_prev.mul_(beta1).add_(grad_reshaped, alpha=1.0 - beta1)
+                vt = vt_prev_corrected.mul_(beta2).addcmul_(grad_reshaped, grad_reshaped, value=1.0 - beta2)
 
-            if group['use_bias_correction']:
-                bias_correction1 = 1.0 - beta1 ** state['step']
-                bias_correction2 = 1.0 - beta2 ** state['step']
-            else:
-                bias_correction1 = 1.0
-                bias_correction2 = 1.0
-            step_size = group['lr'] / bias_correction1
+                if group['use_bias_correction']:
+                    bias_correction1 = 1.0 - beta1 ** state['step']
+                    bias_correction2 = 1.0 - beta2 ** state['step']
+                else:
+                    bias_correction1 = 1.0
+                    bias_correction2 = 1.0
+                step_size = group['lr'] / bias_correction1
 
-            if group['use_atan2']:
-                a = 1.2732395
-                denom = (vt / bias_correction2).sqrt()
-                update = torch.atan2(mt, denom).mul_(a)
-            else:
-                denom = (vt / bias_correction2).sqrt().add_(group['eps'])
-                update = mt / denom
-            
-            update = update.view(p.shape)
-            if group['use_grams']:
-                update = grad_reshaped.sign() * update.abs()
-            update.mul_(step_size)
+                if group['use_atan2']:
+                    a = 1.2732395
+                    denom = (vt / bias_correction2).sqrt()
+                    update = torch.atan2(mt, denom).mul_(a)
+                else:
+                    denom = (vt / bias_correction2).sqrt().add_(group['eps'])
+                    update = mt / denom
+                
+                update = update.view(p.shape)
+                if group['use_grams']:
+                    update = grad_reshaped.sign() * update.abs()
+                update.mul_(step_size)
 
-            # Compress updated momenta and store new factors
-            mu_m_new, ms_m_new, mv_m_new = _rsvd(mt, rank, oversampling)
-            state['mu_m'].copy_(mu_m_new)
-            state['ms_m'].copy_(ms_m_new)
-            state['mv_m'].copy_(mv_m_new)
+                # Compress updated momenta and store new factors
+                mu_m_new, ms_m_new, mv_m_new = _rsvd(mt, rank, oversampling)
+                state['mu_m'].copy_(mu_m_new)
+                state['ms_m'].copy_(ms_m_new)
+                state['mv_m'].copy_(mv_m_new)
 
-            mu_v_new, ms_v_new, mv_v_new = _rsvd(vt, rank, oversampling)
-            state['mu_v'].copy_(mu_v_new)
-            state['ms_v'].copy_(ms_v_new)
-            state['mv_v'].copy_(mv_v_new)
-        else:  # Standard AdamW logic for non-factored tensors
+                mu_v_new, ms_v_new, mv_v_new = _rsvd(vt, rank, oversampling)
+                state['mu_v'].copy_(mu_v_new)
+                state['ms_v'].copy_(ms_v_new)
+                state['mv_v'].copy_(mv_v_new)
+            else:  # Standard AdamW logic for non-factored tensors
+                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad.conj(), value=1 - beta2)
+
+                if group['use_bias_correction']:
+                    bias_correction1 = 1.0 - beta1 ** state['step']
+                    bias_correction2 = 1.0 - beta2 ** state['step']
+                else:
+                    bias_correction1 = 1.0
+                    bias_correction2 = 1.0
+                step_size = group['lr'] / bias_correction1
+
+                if group['use_atan2']:
+                    a = 1.2732395
+                    denom = (exp_avg_sq / bias_correction2).sqrt()
+                    update = torch.atan2(exp_avg, denom).mul_(a)
+                else:
+                    denom = (exp_avg_sq / bias_correction2).sqrt().add_(group['eps'])
+                    update = exp_avg / denom
+
+                if group['use_grams']:
+                    update = grad.sign() * update.abs()
+                update = update.mul_(step_size)
+        else:  
             exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
 
             exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
